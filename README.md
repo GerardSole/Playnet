@@ -50,7 +50,7 @@ Playnet is a monolithic game backend built as a portfolio project to demonstrate
 └───────────────┬─────────────────┬───────────────┘
                 │                 │
          ┌──────▼──────┐   ┌─────▼─────┐
-         │  PostgreSQL  │   │   Redis   │
+         │  PostgreSQL │   │   Redis   │
          │  (persist)  │   │  (queue,  │
          │             │   │  sessions,│
          └─────────────┘   │  pub/sub) │
