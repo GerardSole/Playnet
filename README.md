@@ -41,12 +41,12 @@ Playnet is a monolithic game backend built as a portfolio project to demonstrate
 
 ```
 ┌─────────────────────────────────────────────────┐
-│                   API (Fastify)                  │
-│                                                  │
-│  Auth  Users  Friends  Presence  Matchmaking     │
-│  Leaderboards  Notifications                     │
-│                                                  │
-│  Controller → Service → Repository               │
+│                   API (Fastify)                 │
+│                                                 │
+│  Auth  Users  Friends  Presence  Matchmaking    │
+│  Leaderboards  Notifications                    │
+│                                                 │
+│  Controller → Service → Repository              │
 └───────────────┬─────────────────┬───────────────┘
                 │                 │
          ┌──────▼──────┐   ┌─────▼─────┐
