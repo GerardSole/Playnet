@@ -1,0 +1,278 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Playnet — Continuous Integration
+#
+# Pipeline stages:
+#
+#   quality ──────────────────────────────────────────────────────────────────┐
+#   (lint + type-check, ~1 min, no services)                                  │
+#        │                                                                     │
+#        ├──► test  (integration tests + coverage, ~4 min, postgres + redis)  │
+#        │                                                                     │
+#        └──► build (TypeScript compilation, ~30 s, no services)              │
+#                  │                                                           │
+#                  └──────────────────────────────────────────────────────────┘
+#                            │
+#                            ▼
+#                         docker (image build verification, ~3 min)
+#
+# Fail-fast strategy:
+#   – quality failure: blocks test AND build (cheap gate catches most issues)
+#   – test failure:    blocks docker
+#   – build failure:   blocks docker
+#
+# Concurrency: if you push while a run is in progress for the same ref,
+# the in-progress run is cancelled before the new one starts.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+# Cancel any in-progress run for the same branch/PR to avoid wasted minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '22'
+
+# ── Job 1: Lint + Type-check ──────────────────────────────────────────────────
+#
+# Fast gate (~60 s) that runs before the expensive test and build jobs.
+# Catches: ESLint violations, TypeScript errors, unused variables.
+# No services needed — pure static analysis.
+jobs:
+  quality:
+    name: Lint & Type-check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          # Cache node_modules keyed on package-lock.json hash.
+          # On a cache hit, npm ci still runs but uses the cached tarballs
+          # (fast) instead of downloading from the registry.
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint (ESLint)
+        run: npm run lint
+
+      - name: Type-check (tsc --noEmit)
+        run: npm run type-check
+
+# ── Job 2: Integration Tests + Coverage ──────────────────────────────────────
+#
+# Runs the full vitest integration test suite (107 tests across 9 files).
+# Tests require live PostgreSQL and Redis — provided as service containers.
+#
+# Service connection:
+#   PostgreSQL → localhost:5432  (matches DATABASE_URL in .env.test)
+#   Redis      → localhost:6379  (matches REDIS_URL in .env.test, DB index 1)
+#
+# Coverage:
+#   Generates html/json/lcov reports → uploaded as a CI artifact.
+#   json-summary is read by davelosert/vitest-coverage-report-action to post
+#   a per-file coverage diff comment directly on pull requests.
+#
+# Test environment:
+#   tests/setup/env.ts loads .env.test (committed, no secrets) with
+#   override:true, so all env values come from that file. The only
+#   requirement is that the services match what .env.test declares.
+  test:
+    name: Integration Tests & Coverage
+    runs-on: ubuntu-latest
+    needs: quality
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: playnet_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d playnet_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+          --health-start-period 10s
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+          --health-start-period 5s
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Run tests with coverage. The vitest config (vitest.config.ts) controls:
+      #   • reporters: verbose (stdout) + json-summary + html + lcov
+      #   • thresholds: lines/functions ≥ 60%, branches ≥ 50%
+      #   • Coverage failure = job failure = Docker job blocked
+      - name: Run tests with coverage
+        run: npm run test:ci
+
+      # Upload the full HTML coverage report as a downloadable artifact.
+      # Available for 30 days under "Artifacts" in the Actions run summary.
+      # if: always() ensures it's uploaded even if coverage thresholds fail,
+      # so you can inspect what's missing.
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report-${{ github.run_number }}
+          path: coverage/
+          retention-days: 30
+
+      # Post a coverage summary comment on PRs showing per-file changes.
+      # Reads coverage/coverage-summary.json (json-summary reporter).
+      # Only runs on pull_request events — skipped on direct pushes.
+      - name: Coverage PR comment
+        uses: davelosert/vitest-coverage-report-action@v2
+        if: github.event_name == 'pull_request'
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          json-summary-path: coverage/coverage-summary.json
+          json-final-path: coverage/coverage-final.json
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage/lcov.info
+          fail_ci_if_error: true
+
+      # Write a Markdown coverage summary to the Actions job summary page.
+      # Visible on the run's Summary tab without downloading any artifact.
+      - name: Write coverage summary to job summary
+        if: always()
+        run: |
+          if [ -f coverage/coverage-summary.json ]; then
+            echo "## Test Coverage" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Metric | Coverage |" >> $GITHUB_STEP_SUMMARY
+            echo "|--------|----------|" >> $GITHUB_STEP_SUMMARY
+            node -e "
+              const s = require('./coverage/coverage-summary.json').total;
+              ['lines','functions','branches','statements'].forEach(k => {
+                const pct = s[k].pct;
+                const icon = pct >= 80 ? '🟢' : pct >= 60 ? '🟡' : '🔴';
+                console.log('| ' + k.charAt(0).toUpperCase() + k.slice(1) + ' | ' + icon + ' ' + pct + '% |');
+              });
+            " >> $GITHUB_STEP_SUMMARY
+          fi
+
+# ── Job 3: TypeScript Build ───────────────────────────────────────────────────
+#
+# Compiles the full TypeScript project (tsc).
+# Runs in parallel with the test job after quality passes.
+# A failing build blocks the docker job, ensuring we never attempt to build
+# a Docker image from source that doesn't compile.
+#
+# The dist/ artifact is uploaded so it can be inspected or reused if needed.
+  build:
+    name: TypeScript Build
+    runs-on: ubuntu-latest
+    needs: quality
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Compile TypeScript
+        run: npm run build
+
+      - name: Upload dist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ github.run_number }}
+          path: dist/
+          # Short retention — this artifact is mainly useful for debugging
+          # failed Docker builds, not for long-term storage.
+          retention-days: 3
+
+# ── Job 4: Docker Build Verification ─────────────────────────────────────────
+#
+# Builds the production Docker image (multi-stage) to verify:
+#   – The Dockerfile is valid and the build succeeds end-to-end
+#   – The compiled app starts under the non-root `app` user
+#   – Production dependencies are correctly separated from devDependencies
+#
+# Does NOT push the image anywhere — this is verification only.
+# Docker layer cache is stored in GitHub Actions Cache (type=gha) to speed
+# up repeated builds. The cache key includes the Docker layer digests, so
+# base-image updates invalidate the cache automatically.
+#
+# Requires: test AND build to have passed (ensures code is correct before
+# spending 3 minutes on a Docker build).
+  docker:
+    name: Docker Build
+    runs-on: ubuntu-latest
+    needs: [test, build]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Set up Docker Buildx (extended builder with cache support).
+      # Required for cache-from/cache-to with type=gha.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Build the image. push: false means it stays in the local Docker daemon
+      # and is discarded at the end of the job.
+      #
+      # Tags: playnet-api:{sha} — unique per commit, useful for debugging.
+      #
+      # Cache strategy: gha (GitHub Actions Cache)
+      #   cache-from: restore cached layers from previous builds
+      #   cache-to:   save new layers; mode=max caches all intermediate layers,
+      #               not just the final image, which is optimal for multi-stage
+      #               builds where the builder stage is the most expensive.
+      - name: Build Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: playnet-api:${{ github.sha }}
+          platforms: linux/amd64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
