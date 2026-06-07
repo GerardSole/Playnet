@@ -5,11 +5,11 @@
 #
 #   quality ──────────────────────────────────────────────────────────────────┐
 #   (lint + type-check, ~1 min, no services)                                  │
-#        │                                                                     │
+#        │                                                                    │
 #        ├──► test  (integration tests + coverage, ~4 min, postgres + redis)  │
-#        │                                                                     │
+#        │                                                                    │
 #        └──► build (TypeScript compilation, ~30 s, no services)              │
-#                  │                                                           │
+#                  │                                                          │
 #                  └──────────────────────────────────────────────────────────┘
 #                            │
 #                            ▼
